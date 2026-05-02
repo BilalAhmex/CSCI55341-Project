@@ -1,84 +1,172 @@
 library(SPARK)
 library(Matrix)
 
-# ── File paths ────────────────────────────────────────────────────────────────
-expression_file <- "data/Rep11_MOB_trans.tsv"
-coordinate_file <- "data/Rep11_MOB_trans.idx"
+# ── Output directory ──────────────────────────────────────────────────────────
+output_dir <- "SPARK_Results"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
 
-# ── Load expression data ──────────────────────────────────────────────────────
-df <- read.delim(expression_file, sep = "\t", row.names = "gene", check.names = FALSE)
+# ── Dataset definitions ───────────────────────────────────────────────────────
+datasets <- list(
+  Rep11_MOB = list(
+    type       = "tsv",
+    expr_file  = "data/Rep11_MOB_trans.tsv",
+    coord_file = "data/Rep11_MOB_trans.idx"
+  ),
+  Layer_2_BC = list(
+    type       = "tsv",
+    expr_file  = "data/Layer2_BC_trans.tsv",
+    coord_file = "data/Layer2_BC_trans.idx"
+  ),
+  seqfish = list(
+    type = "xlsx",
+    file = "data/seqfish.xlsx"
+  )
+)
 
-# Drop ensemblid column if present
-if ("ensemblid" %in% colnames(df)) {
-  df <- df[, colnames(df) != "ensemblid"]
+# ── Loop over datasets ────────────────────────────────────────────────────────
+for (dataset_name in names(datasets)) {
+  info <- datasets[[dataset_name]]
+  cat(sprintf("\n%s\nProcessing dataset: %s\n%s\n",
+              strrep("=", 50), dataset_name, strrep("=", 50)))
+
+  # Check if both scaled and unscaled results already exist
+  file_unscaled <- file.path(output_dir, sprintf("SPARK_%s_unscaled_results.csv", dataset_name))
+  file_scaled   <- file.path(output_dir, sprintf("SPARK_%s_scaled_results.csv",   dataset_name))
+
+  if (file.exists(file_unscaled) && file.exists(file_scaled)) {
+    cat(sprintf("Skipping %s: Both scaled and unscaled results already exist.\n", dataset_name))
+    next
+  }
+
+  # ── 1. LOAD DATA ─────────────────────────────────────────────────────────────
+  if (info$type == "tsv") {
+    if (!file.exists(info$expr_file) || !file.exists(info$coord_file)) {
+      cat(sprintf("Skipping %s: Files not found.\n", dataset_name))
+      next
+    }
+
+    # Load expression
+    df <- read.delim(info$expr_file, sep = "\t", row.names = "gene", check.names = FALSE)
+    if ("ensemblid" %in% colnames(df)) {
+      df <- df[, colnames(df) != "ensemblid"]
+    }
+    counts <- t(df)  # spots x genes
+
+    # Load coordinates
+    coord_df    <- read.delim(info$coord_file, sep = "\t", row.names = 1, check.names = FALSE)
+    sample_info <- as.data.frame(t(coord_df))
+
+  } else if (info$type == "xlsx") {
+    if (!file.exists(info$file)) {
+      cat(sprintf("Skipping %s: File not found.\n", dataset_name))
+      next
+    }
+
+    if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+    library(readxl)
+
+    # Load expression
+    counts_df <- as.data.frame(read_excel(info$file, sheet = "Hippocampus Counts", col_names = FALSE))
+    rownames(counts_df) <- counts_df[[1]]
+    counts_df <- counts_df[, -1]
+    counts <- t(counts_df)  # spots x genes
+
+    # Load coordinates
+    coord_df    <- as.data.frame(read_excel(info$file, sheet = "Centroids", col_names = FALSE))
+    sample_info <- coord_df[, 1:2]
+    colnames(sample_info) <- c("x", "y")
+    rownames(sample_info) <- rownames(counts)
+
+  } else {
+    cat(sprintf("Unknown file type for %s. Skipping.\n", dataset_name))
+    next
+  }
+
+  # ── 2. FILTER ────────────────────────────────────────────────────────────────
+  # Filter lowly expressed genes (sum >= 3)
+  counts <- counts[, colSums(counts) >= 3]
+
+  # Calculate total counts per spot (sequencing depth)
+  sample_info$x            <- as.numeric(sample_info$x)
+  sample_info$y            <- as.numeric(sample_info$y)
+  sample_info$total_counts <- rowSums(counts)
+
+  # Filter out poor quality spots
+  valid_spots <- sample_info$total_counts > 10
+  sample_info <- sample_info[valid_spots, ]
+  counts      <- counts[valid_spots, ]
+
+  # Align coordinates with expression matrix
+  sample_info <- sample_info[rownames(counts), ]
+
+  cat(sprintf("Filtered matrix: %d spots, %d genes.\n", nrow(counts), ncol(counts)))
+
+  # ── 3. RUN SPARK (SCALED VS UNSCALED) ────────────────────────────────────────
+  for (is_scaled in c(FALSE, TRUE)) {
+    scale_label     <- ifelse(is_scaled, "scaled", "unscaled")
+    output_filename <- file.path(output_dir,
+                                 sprintf("SPARK_%s_%s_results.csv", dataset_name, scale_label))
+
+    if (file.exists(output_filename)) {
+      cat(sprintf("\n-> Skipping SPARK (%s): File already exists.\n", scale_label))
+      next
+    }
+
+    cat(sprintf("\n--- Running SPARK for %s (%s) ---\n", dataset_name, scale_label))
+
+    # Copy coordinates so we don't permanently alter them
+    current_sample_info <- sample_info
+
+    if (is_scaled) {
+      cat("Scaling coordinates to [0, 1] range...\n")
+      current_sample_info$x <- (current_sample_info$x - min(current_sample_info$x)) /
+                               (max(current_sample_info$x) - min(current_sample_info$x))
+      current_sample_info$y <- (current_sample_info$y - min(current_sample_info$y)) /
+                               (max(current_sample_info$y) - min(current_sample_info$y))
+    } else {
+      cat("Using raw coordinates...\n")
+    }
+
+    # SPARK expects genes x spots
+    counts_spark <- t(counts)
+
+    # ── Create SPARK object ─────────────────────────────────────────────────
+    spark <- CreateSPARKObject(
+      counts           = counts_spark,
+      location         = current_sample_info[, c("x", "y")],
+      percentage       = 0.1,
+      min_total_counts = 3
+    )
+    spark@lib_size <- apply(spark@counts, 2, sum)
+
+    # ── Fit model and test ──────────────────────────────────────────────────
+    cat("Fitting variance components...\n")
+    spark <- spark.vc(
+      spark,
+      covariates = NULL,
+      lib_size   = spark@lib_size,
+      num_core   = 4,
+      verbose    = FALSE
+    )
+
+    cat("Running hypothesis tests...\n")
+    spark <- spark.test(
+      spark,
+      check_positive = TRUE,
+      verbose        = FALSE
+    )
+
+    # ── Save results ────────────────────────────────────────────────────────
+    results         <- spark@res_mtest
+    results$gene    <- rownames(results)
+    results_sorted  <- results[order(results$adjusted_pvalue), ]
+
+    cat(sprintf("\nTop 5 Spatially Variable Genes (%s):\n", scale_label))
+    print(head(results_sorted[, c("gene", "combined_pvalue", "adjusted_pvalue")], 5))
+
+    write.csv(results_sorted, output_filename, row.names = FALSE)
+    cat(sprintf("Saved results to %s\n", output_filename))
+  }
 }
 
-# Transpose: spots as rows, genes as columns (same as your counts = df.T)
-counts <- t(df)  # now: spots x genes
-
-# ── Filter lowly expressed genes (sum >= 3) ───────────────────────────────────
-gene_sums <- colSums(counts)
-counts <- counts[, gene_sums >= 3]
-cat(sprintf("Filtered matrix: %d spots, %d genes.\n", nrow(counts), ncol(counts)))
-
-# ── Load and process coordinates ──────────────────────────────────────────────
-coord_df <- read.delim(coordinate_file, sep = "\t", row.names = 1, check.names = FALSE)
-
-# Transpose so spots are rows, x and y are columns (same as sample_info = coord_df.T)
-sample_info <- as.data.frame(t(coord_df))
-sample_info$x <- as.numeric(sample_info$x)
-sample_info$y <- as.numeric(sample_info$y)
-
-# Scale x and y to [0, 1] range
-sample_info$x <- (sample_info$x - min(sample_info$x)) / (max(sample_info$x) - min(sample_info$x))
-sample_info$y <- (sample_info$y - min(sample_info$y)) / (max(sample_info$y) - min(sample_info$y))
-
-# Align coordinates with expression matrix rows
-sample_info <- sample_info[rownames(counts), ]
-
-# ── Prepare count matrix for SPARK ───────────────────────────────────────────
-# SPARK expects genes x spots (opposite of your counts matrix), so transpose back
-counts_spark <- t(counts)  # now: genes x spots
-
-# ── Create SPARK object ───────────────────────────────────────────────────────
-spark <- CreateSPARKObject(
-  counts      = counts_spark,
-  location    = sample_info[, c("x", "y")],
-  percentage  = 0.1,           # min fraction of spots expressing a gene
-  min_total_counts = 3         # matches your sum >= 3 filter
-)
-
-spark@lib_size <- apply(spark@counts, 2, sum)
-
-cat(sprintf("SPARK object: %d genes, %d spots.\n",
-            nrow(spark@counts), ncol(spark@counts)))
-
-# ── Run SPARK ─────────────────────────────────────────────────────────────────
-cat("Fitting variance components...\n")
-spark <- spark.vc(
-  spark,
-  covariates       = NULL,
-  lib_size         = spark@lib_size,
-  num_core         = 4,       # adjust to your machine
-  verbose          = FALSE
-)
-
-cat("Running hypothesis tests...\n")
-spark <- spark.test(
-  spark,
-  check_positive = TRUE,
-  verbose        = FALSE
-)
-
-# ── View and save results ─────────────────────────────────────────────────────
-results <- spark@res_mtest
-results$gene <- rownames(results)
-
-# Sort by adjusted p-value (equivalent to qval in SpatialDE)
-results_sorted <- results[order(results$adjusted_pvalue), ]
-
-cat("\nTop 5 Spatially Variable Genes:\n")
-print(head(results_sorted[, c("gene", "combined_pvalue", "adjusted_pvalue")], 5))
-
-write.csv(results_sorted, "SPARK_Rep11_MOB_results.csv", row.names = FALSE)
-cat("Results saved to SPARK_Rep11_MOB_results.csv\n")
+cat("\nAll datasets processed.\n")
