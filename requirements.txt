@@ -1,0 +1,6 @@
+pandas
+numpy
+scipy<1.12.0
+openpyxl
+SpatialDE
+patsy

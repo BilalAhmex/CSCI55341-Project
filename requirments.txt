@@ -1,1 +1,0 @@
-pip install "scipy<1.12"
