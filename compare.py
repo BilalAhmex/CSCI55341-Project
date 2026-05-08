@@ -29,7 +29,6 @@ def calculate_morans_i(expr, coords):
     n = len(expr)
     dists = squareform(pdist(coords))
     
-    # NEW: Prevent division by zero from exact duplicate coordinates
     dists[dists == 0] = 1e-9 
     
     np.fill_diagonal(dists, np.inf)
