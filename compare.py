@@ -23,8 +23,15 @@ def rank_biased_overlap(list1, list2, p=0.9):
     return (1 - p) * score
 
 def calculate_morans_i(expr, coords):
+    # Handle any potential NaNs in the expression data by converting them to 0
+    expr = np.nan_to_num(expr, nan=0.0) 
+    
     n = len(expr)
     dists = squareform(pdist(coords))
+    
+    # NEW: Prevent division by zero from exact duplicate coordinates
+    dists[dists == 0] = 1e-9 
+    
     np.fill_diagonal(dists, np.inf)
     w = 1.0 / dists
     np.fill_diagonal(w, 0)
